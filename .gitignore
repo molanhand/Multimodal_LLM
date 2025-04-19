@@ -6998,3 +6998,6 @@ MemotionDataset7K/memotion_dataset_7k/images/image_6991.jpg
 MemotionDataset7K/memotion_dataset_7k/images/image_6992.jpg
 MemotionDataset7K/archive.zip
 MemotionDataset7K/clip_memotion_model.pth
+MemotionDataset7K/embeddings_cache/train_clip_features.pt
+MemotionDataset7K/embeddings_cache/train_features_clip-vit-base-patch32.pt
+MemotionDataset7K/embeddings_cache/train_fused_features_clip-vit-base-patch32.pt
