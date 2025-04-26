@@ -20,6 +20,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
 warnings.filterwarnings("ignore")
+from sklearn.decomposition import PCA
+from imblearn.over_sampling import SMOTE
 
 # 初始化设置
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -483,6 +485,117 @@ def extract_fused_features_for_index(model, dataframe, images_dir, processor, de
     model.train() # 恢复训练模式
     return result
 
+# === SMOTE Integration Start ===
+# SMOTE特征增强核心代码
+def apply_smote(features, labels):
+    """
+    Applies SMOTE to features after PCA dimensionality reduction.
+    
+    Args:
+        features (torch.Tensor or np.ndarray): High-dimensional features.
+        labels (torch.Tensor or np.ndarray): Corresponding labels.
+        
+    Returns:
+        tuple: (resampled_features_original_dim, resampled_labels) as numpy arrays.
+    """
+    print(f"Original training data shape: {features.shape}, Label distribution: {np.bincount(labels)}")
+    
+    # Ensure data is on CPU and in numpy format
+    if isinstance(features, torch.Tensor):
+        features_np = features.cpu().numpy()
+    else:
+        features_np = features
+        
+    if isinstance(labels, torch.Tensor):
+        labels_np = labels.cpu().numpy()
+    else:
+        labels_np = labels
+
+    # Apply PCA
+    # Using min(n_samples, n_features) for n_components if features < 32
+    n_components_pca = min(min(features_np.shape), 32)
+    if n_components_pca < 2: # SMOTE needs at least 2 dimensions
+        print(f"Warning: Not enough features ({features_np.shape[1]}) or samples ({features_np.shape[0]}) for PCA + SMOTE. Skipping SMOTE.")
+        return features_np, labels_np
+
+    print(f"Applying PCA with n_components={n_components_pca}")
+    pca = PCA(n_components=n_components_pca)
+    try:
+        low_dim = pca.fit_transform(features_np)
+    except Exception as e:
+        print(f"Error during PCA: {e}. Skipping SMOTE.")
+        return features_np, labels_np
+
+    # Apply SMOTE
+    # k_neighbors should be less than the number of minority samples
+    minority_count = np.sum(labels_np == 1) # Assuming 1 is the minority class
+    k = min(5, minority_count - 1) if minority_count > 1 else 1
+    
+    if k < 1:
+         print(f"Warning: Not enough minority samples ({minority_count}) for SMOTE. Skipping SMOTE.")
+         return features_np, labels_np
+         
+    print(f"Applying SMOTE with k_neighbors={k}")
+    try:
+        sm = SMOTE(k_neighbors=k, random_state=42)
+        resampled_low_dim, res_labels = sm.fit_resample(low_dim, labels_np)
+    except Exception as e:
+        print(f"Error during SMOTE: {e}. Skipping SMOTE.")
+        return features_np, labels_np
+
+    print(f"Resampled data shape: {resampled_low_dim.shape}, Resampled label distribution: {np.bincount(res_labels)}")
+
+    # Add Gaussian noise to synthetic samples (optional, helps prevent overfitting)
+    # Identify synthetic samples added by SMOTE
+    num_original = len(features_np)
+    if len(resampled_low_dim) > num_original:
+        noise = np.random.normal(0, 0.05, resampled_low_dim[num_original:].shape) # Smaller noise
+        resampled_low_dim[num_original:] += noise
+        print(f"Added noise to {len(resampled_low_dim) - num_original} synthetic samples.")
+
+    # Inverse transform back to original dimension
+    try:
+        resampled_original_dim = pca.inverse_transform(resampled_low_dim)
+    except Exception as e:
+        print(f"Error during PCA inverse transform: {e}. Returning low-dimensional resampled data.")
+        # Fallback: return low-dim data if inverse transform fails
+        return resampled_low_dim, res_labels 
+
+    print("SMOTE application finished.")
+    return resampled_original_dim, res_labels
+
+# 动态损失加权实现
+class DynamicLossWrapper:
+    def __init__(self, initial_alpha=0.7, final_alpha=0.9, total_epochs=15):
+        """
+        Initializes the dynamic loss wrapper. Alpha controls CE loss weight.
+        Gradually increases alpha from initial_alpha towards final_alpha.
+        """
+        self.initial_alpha = initial_alpha
+        self.final_alpha = final_alpha
+        self.total_epochs = total_epochs
+        # Simple linear interpolation for alpha
+        # Could use logarithmic or other schedules too
+        self.alpha_schedule = np.linspace(initial_alpha, final_alpha, total_epochs)
+
+    def get_alpha(self, epoch):
+        """ Gets the alpha value for the current epoch. """
+        # Clip epoch index to be within bounds
+        epoch_idx = max(0, min(epoch, self.total_epochs - 1))
+        return self.alpha_schedule[epoch_idx]
+
+    def __call__(self, ce_loss, cl_loss, epoch):
+        """ Calculates the combined loss using dynamic alpha. """
+        current_alpha = self.get_alpha(epoch)
+        # Ensure cl_loss is a tensor
+        if not isinstance(cl_loss, torch.Tensor):
+            cl_loss = torch.tensor(cl_loss, device=ce_loss.device) # Make sure device matches
+            
+        combined_loss = current_alpha * ce_loss + (1.0 - current_alpha) * cl_loss
+        # print(f"Epoch {epoch+1}: Alpha={current_alpha:.4f}, CE={ce_loss.item():.4f}, CL={cl_loss.item():.4f}, Combined={combined_loss.item():.4f}") # Debug print
+        return combined_loss
+# === SMOTE Integration End ===
+
 # 训练函数 - 使用检索增强的对比学习
 def train_rgcl_model(model, train_loader, val_loader, test_loader, device, config=None):
     """训练RGCL模型函数"""
@@ -514,41 +627,77 @@ def train_rgcl_model(model, train_loader, val_loader, test_loader, device, confi
     criterion_ce = nn.CrossEntropyLoss(
         weight=torch.tensor(class_weights, dtype=torch.float).to(device)
     )
-    
     criterion_cl = SimpleContrastiveLoss(temperature=config.TEMPERATURE)
-    
-    # 提取训练数据的 *融合* 特征并构建检索索引
+    # === Dynamic Loss Wrapper ===
+    dynamic_loss = DynamicLossWrapper(
+        initial_alpha=config.ALPHA, # Use config.ALPHA as starting point
+        final_alpha=0.95,           # Gradually increase focus on CE loss
+        total_epochs=config.NUM_EPOCHS
+    )
+
+    # === Feature Extraction & SMOTE Application ===
     cache_filename = f"train_fused_features_{config.MODEL_NAME.split('/')[-1]}.pt"
     cache_file = os.path.join(config.EMBEDDING_CACHE_DIR, cache_filename)
 
     index = None
     norm_features = None
-    retrieval_labels = None
+    retrieval_labels = None # Labels corresponding to the features in the index
 
     try:
-        # 使用新函数提取融合特征
+        # 1. Extract original fused features
         train_fused_features_data = extract_fused_features_for_index(
-            model,          # 使用当前初始化的模型
+            model,
             train_df,
             Config.IMAGES_DIR,
-            train_loader.dataset.processor, # 从训练加载器获取processor
+            train_loader.dataset.processor,
             device,
             batch_size=config.BATCH_SIZE,
-            cache_file=cache_file
+            cache_file=cache_file # Use cache if available
+        )
+        original_features = train_fused_features_data["features"] # Tensor
+        original_labels = train_fused_features_data["labels"]     # Tensor
+
+        # 2. Apply SMOTE (operates on numpy arrays)
+        # Pass tensors directly, apply_smote handles conversion
+        smote_features_np, smote_labels_np = apply_smote(
+            original_features,
+            original_labels
         )
 
-        # 使用融合特征构建FAISS索引 (现在是512维)
-        index, norm_features = build_faiss_index(train_fused_features_data["features"])
-        retrieval_labels = train_fused_features_data["labels"] # 获取对应的标签
-        print(f"FAISS index built with {norm_features.shape[0]} samples, dimension {norm_features.shape[1]}.")
+        # Convert back to tensors for FAISS
+        smote_features = torch.from_numpy(smote_features_np).float()
+        smote_labels = torch.from_numpy(smote_labels_np).long()
+
+        # 3. Build FAISS index using SMOTE-augmented features
+        print("Building FAISS index with SMOTE-augmented features...")
+        # build_faiss_index expects a tensor
+        index, norm_features = build_faiss_index(smote_features)
+        retrieval_labels = smote_labels # Use SMOTE labels for retrieval check
+        print(f"FAISS index built with {norm_features.shape[0]} samples (after SMOTE), dimension {norm_features.shape[1]}.")
+        print(f"Label distribution in index: {np.bincount(retrieval_labels.numpy())}")
+
 
     except Exception as e:
-        print(f"构建索引时出错: {str(e)}")
-        print("将退回到不使用检索增强的训练方式")
+        print(f"构建索引或应用SMOTE时出错: {str(e)}")
+        print("将退回到不使用检索增强和SMOTE的训练方式")
         index = None
         norm_features = None
         retrieval_labels = None
-    
+        # Fallback: Use original features if SMOTE/Indexing fails
+        if 'original_features' in locals():
+             try:
+                 print("Falling back to building index with original features...")
+                 index, norm_features = build_faiss_index(original_features)
+                 retrieval_labels = original_labels
+                 print(f"FAISS index built with {norm_features.shape[0]} original samples.")
+             except Exception as e_fallback:
+                 print(f"Fallback index building failed: {e_fallback}")
+                 index = None # Ensure index is None if fallback fails too
+                 norm_features = None
+                 retrieval_labels = None
+
+
+    # === Training Loop Start ===
     # 训练状态追踪
     best_val_f1 = 0.0
     best_state = None
@@ -556,189 +705,181 @@ def train_rgcl_model(model, train_loader, val_loader, test_loader, device, confi
     no_improve = 0
     
     print(f"Starting training with RGCL using {config.MODEL_NAME}...")
-    print(f"Training parameters: BatchSize={config.BATCH_SIZE}, LR={config.LEARNING_RATE}, Alpha={config.ALPHA}")
+    print(f"Training parameters: BatchSize={config.BATCH_SIZE}, LR={config.LEARNING_RATE}, Initial Alpha={dynamic_loss.initial_alpha}")
+    if index is not None:
+        print("SMOTE applied to features used for retrieval index.")
+    else:
+        print("SMOTE could not be applied or index building failed.")
     start_time = time.time()
-    
+
     for epoch in range(config.NUM_EPOCHS):
         model.train()
         train_loss, train_ce_loss, train_cl_loss = 0.0, 0.0, 0.0
         train_preds, train_true = [], []
-        
+
         for batch_idx, batch in enumerate(train_loader):
             try:
                 # 准备输入数据
                 inputs = {
-                    k: v.to(device) 
-                    for k, v in batch.items() 
+                    k: v.to(device)
+                    for k, v in batch.items()
                     if k in ["pixel_values", "input_ids", "attention_mask"]
                 }
                 labels = batch["label"].to(device)
-                
+
                 # 前向传播
                 outputs = model(**inputs)
                 logits = outputs["logits"]
-                fused_emb = outputs["fused_embeds"] # 这是512维特征
-                
-                # 计算交叉熵损失
+                fused_emb = outputs["fused_embeds"]
+
+                # --- Loss Calculation ---
+                # 1. Cross-Entropy Loss (on original batch data)
                 ce_loss = criterion_ce(logits, labels)
-                
-                # 默认只使用CE损失
-                cl_loss_val = torch.tensor(0.0, device=device) # 重命名变量以避免混淆
-                
-                # 如果有检索索引，使用检索增强的对比学习
+
+                # 2. Contrastive Loss (using SMOTE-augmented index)
+                cl_loss_val = torch.tensor(0.0, device=device)
                 if index is not None and norm_features is not None and retrieval_labels is not None:
                     try:
-                        # 使用当前批次的 *融合* 特征进行检索 (512维)
+                        # Retrieve using current batch's fused features against SMOTE'd index
                         query_features = fused_emb.detach().cpu()
-                        
-                        # 检索相似样本
                         _, indices = retrieve_similar_samples(
                             index,
-                            query_features, # 使用512维查询特征
+                            query_features,
                             k=config.RETRIEVAL_K
                         )
 
-                        # 获取检索的特征和标签
+                        # Get retrieved features (from SMOTE'd norm_features) and labels
+                        # Ensure retrieval_labels is on CPU for indexing
+                        retrieval_labels_cpu = retrieval_labels.cpu()
                         retrieval_features_batch = []
                         retrieval_labels_batch = []
+                        feature_dim = norm_features.size(1) # Should be 512
 
-                        # 对每个样本获取其检索结果的特征和标签
-                        # norm_features 现在是 (num_train_samples, 512)
-                        # retrieval_labels 现在是 (num_train_samples,)
-                        feature_dim = norm_features.size(1) #应该是512
-                        
-                        for i, idx_list in enumerate(indices): # indices 形状 (batch_size, k)
-                             # 确保索引有效
+                        for i, idx_list in enumerate(indices):
+                            # Ensure indices are valid for the potentially larger SMOTE'd index
                             valid_idx_list = [idx for idx in idx_list if idx >= 0 and idx < len(norm_features)]
+                            
                             if not valid_idx_list:
-                                print(f"警告: 样本 {i} 没有有效的检索结果，跳过对比损失计算。")
-                                # 添加占位符或处理方式
-                                # 为了保持批次形状，可以添加零向量或复制锚点等策略，但最简单的是跳过此样本的CL计算
-                                # 这里简单处理：添加一个零向量确保维度，但它不会贡献损失
+                                # Handle cases with no valid retrievals (e.g., padding)
                                 sample_retrieval_features = torch.zeros((config.RETRIEVAL_K, feature_dim), dtype=norm_features.dtype)
-                                sample_retrieval_labels = torch.full((config.RETRIEVAL_K,), -1, dtype=retrieval_labels.dtype) # 无效标签
+                                sample_retrieval_labels = torch.full((config.RETRIEVAL_K,), -1, dtype=retrieval_labels_cpu.dtype) # Use -1 for invalid
                             else:
-                                # 获取当前样本的所有检索结果特征 (k, 512)
+                                # Retrieve features and labels using valid indices
                                 sample_retrieval_features = norm_features[valid_idx_list]
-                                # 获取对应标签 (k,)
-                                sample_retrieval_labels = retrieval_labels[valid_idx_list]
+                                sample_retrieval_labels = retrieval_labels_cpu[valid_idx_list]
 
-                                # 如果检索到的数量少于K，需要填充以保持一致性
+                                # Pad if fewer than K samples were retrieved/valid
                                 if len(valid_idx_list) < config.RETRIEVAL_K:
                                     num_missing = config.RETRIEVAL_K - len(valid_idx_list)
                                     padding_features = torch.zeros((num_missing, feature_dim), dtype=sample_retrieval_features.dtype)
-                                    padding_labels = torch.full((num_missing,), -1, dtype=sample_retrieval_labels.dtype) # 使用无效标签
+                                    padding_labels = torch.full((num_missing,), -1, dtype=sample_retrieval_labels.dtype)
                                     sample_retrieval_features = torch.cat([sample_retrieval_features, padding_features], dim=0)
                                     sample_retrieval_labels = torch.cat([sample_retrieval_labels, padding_labels], dim=0)
-
 
                             retrieval_features_batch.append(sample_retrieval_features)
                             retrieval_labels_batch.append(sample_retrieval_labels)
 
-
-                        # 转换为张量
-                        # retrieval_features_batch 形状应为 (batch_size, k, 512)
+                        # Stack and move to device
                         retrieval_features_batch = torch.stack(retrieval_features_batch).to(device)
-                        # retrieval_labels_batch 形状应为 (batch_size, k)
                         retrieval_labels_batch = torch.stack(retrieval_labels_batch).to(device)
 
-                        # 计算对比学习损失 (现在anchor和retrieved都是512维)
+                        # Calculate Contrastive Loss
                         cl_loss_val = criterion_cl(
                             fused_emb,              # anchor (batch_size, 512)
                             labels,                 # anchor labels (batch_size,)
-                            retrieval_features_batch, # retrieved (batch_size, k, 512)
-                            retrieval_labels_batch  # retrieved labels (batch_size, k)
+                            retrieval_features_batch, # retrieved (batch_size, k, 512 from SMOTE'd index)
+                            retrieval_labels_batch  # retrieved labels (batch_size, k from SMOTE'd index)
                         )
+
                     except Exception as e:
                         print(f"计算对比损失时出错 (Batch {batch_idx}): {str(e)}")
-                        # 如果检索或计算失败，只使用交叉熵损失
                         cl_loss_val = torch.tensor(0.0, device=device)
-                
-                # 总损失 - 结合交叉熵和对比学习
-                if cl_loss_val > 0:
-                    loss = config.ALPHA * ce_loss + (1 - config.ALPHA) * cl_loss_val
-                else:
-                    loss = ce_loss
-                
-                # 反向传播
+
+                # 3. Combine Losses using Dynamic Wrapper
+                # Pass epoch number (0-indexed) to the wrapper
+                loss = dynamic_loss(ce_loss, cl_loss_val, epoch)
+
+                # --- Backpropagation ---
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                
+
                 # 记录损失和预测
                 train_loss += loss.item() * labels.size(0)
                 train_ce_loss += ce_loss.item() * labels.size(0)
-                if cl_loss_val > 0:
-                    train_cl_loss += cl_loss_val.item() * labels.size(0) # 使用 cl_loss_val
-                
+                if cl_loss_val.item() > 0: # Check if CL was actually computed
+                    train_cl_loss += cl_loss_val.item() * labels.size(0)
+
                 train_preds.extend(logits.argmax(1).cpu().numpy())
                 train_true.extend(labels.cpu().numpy())
-                
-                # 定期打印进度
+
+
+                # Periodic print
                 if batch_idx % 20 == 0:
-                     print(f"Epoch {epoch+1}/{config.NUM_EPOCHS} Batch {batch_idx}/{len(train_loader)}: "
-                        f"Loss={loss.item():.4f} CE={ce_loss.item():.4f} CL={cl_loss_val.item():.4f}") # 使用 cl_loss_val
+                    current_alpha = dynamic_loss.get_alpha(epoch)
+                    print(f"Epoch {epoch+1}/{config.NUM_EPOCHS} Batch {batch_idx}/{len(train_loader)}: "
+                        f"Loss={loss.item():.4f} (Alpha={current_alpha:.3f}) CE={ce_loss.item():.4f} CL={cl_loss_val.item():.4f}")
+
+
             except Exception as e:
                 print(f"处理批次 {batch_idx} 时出错: {str(e)}")
-                continue
-        
-        # 更新学习率
+                continue # Skip batch on error
+
+        # --- End of Epoch ---
         scheduler.step()
-        
-        # 计算训练指标
+
+        # Calculate and print epoch metrics
         train_acc = accuracy_score(train_true, train_preds)
         train_precision, train_recall, train_f1, _ = precision_recall_fscore_support(
             train_true, train_preds, average='binary', zero_division=0
         )
-        
-        # 验证
-        val_metrics = evaluate_rgcl(model, val_loader, criterion_ce, device)
-        
-        # 打印训练和验证结果
-        num_train_samples = len(train_loader.dataset)
-        avg_train_cl_loss = train_cl_loss / num_train_samples if num_train_samples > 0 else 0
+        val_metrics = evaluate_rgcl(model, val_loader, criterion_ce, device) # Evaluation uses only CE loss
+
+        num_train_samples = len(train_true) # Use actual number of processed samples
+        avg_train_loss = train_loss / num_train_samples if num_train_samples > 0 else 0
+        avg_train_ce = train_ce_loss / num_train_samples if num_train_samples > 0 else 0
+        avg_train_cl = train_cl_loss / num_train_samples if num_train_samples > 0 else 0
+
         print(f"\nEpoch {epoch+1}/{config.NUM_EPOCHS} Summary:")
-        print(f"Train - Loss: {train_loss/num_train_samples:.4f} "
-              f"CE: {train_ce_loss/num_train_samples:.4f} "
-              f"CL: {avg_train_cl_loss:.4f}") # 确保除数正确
+        print(f"Train - Loss: {avg_train_loss:.4f} CE: {avg_train_ce:.4f} CL: {avg_train_cl:.4f}")
         print(f"Train - Acc: {train_acc:.4f} F1: {train_f1:.4f} Prec: {train_precision:.4f} Rec: {train_recall:.4f}")
         print(f"Val   - Loss: {val_metrics['loss']:.4f} Acc: {val_metrics['accuracy']:.4f} "
               f"F1: {val_metrics['f1']:.4f} Prec: {val_metrics['precision']:.4f} Rec: {val_metrics['recall']:.4f}")
-        
-        # 保存最佳模型
+
+
+        # Early stopping and best model saving
         if val_metrics['f1'] > best_val_f1:
             best_val_f1 = val_metrics['f1']
             best_state = copy.deepcopy(model.state_dict())
             no_improve = 0
-            print(f"New best model saved! F1: {val_metrics['f1']:.4f}")
+            print(f"New best model saved! Val F1: {val_metrics['f1']:.4f}")
         else:
             no_improve += 1
             if no_improve >= patience:
-                print(f"Early stopping after {epoch+1} epochs")
+                print(f"Early stopping after {epoch+1} epochs due to no improvement in Val F1.")
                 break
-    
-    # 加载最佳模型并进行测试
+
+
+    # --- End of Training ---
+    # Load best model, save it, and evaluate on test set
     if best_state is not None:
         model.load_state_dict(best_state)
-
-        # 保存最佳模型
+        # Update model filename to reflect SMOTE usage potentially
         model_filename = os.path.join(
             config.OUTPUT_DIR,
-            f"rgcl_{config.MODEL_NAME.split('/')[-1]}_fused_model.pth" # 更新模型名
+            f"rgcl_{config.MODEL_NAME.split('/')[-1]}_fused_smote_model.pth" # Indicate SMOTE
         )
         torch.save(best_state, model_filename)
         print(f"Best model saved to {model_filename}")
     else:
-        print("警告: 未找到最佳模型状态，可能是因为训练未改善或提前中断。将使用最终模型进行测试。")
+        print("Warning: No best model state found. Testing with the final model state.")
 
-    # 测试
+
     test_metrics = evaluate_rgcl(model, test_loader, criterion_ce, device)
-    
-    print("\n===== Final Test Results =====")
+
+    print("\n===== Final Test Results (Best Model) =====")
     print(f"Test - Loss: {test_metrics['loss']:.4f} Acc: {test_metrics['accuracy']:.4f} "
           f"F1: {test_metrics['f1']:.4f} Prec: {test_metrics['precision']:.4f} Rec: {test_metrics['recall']:.4f}")
-    
-    # 打印详细分类报告
     print("\nClassification Report:")
     print(classification_report(
         test_metrics['true_labels'],
@@ -746,9 +887,9 @@ def train_rgcl_model(model, train_loader, val_loader, test_loader, device, confi
         target_names=["Not Offensive", "Offensive"],
         zero_division=0
     ))
-    
+
     print(f"Total training time: {time.time()-start_time:.2f}s")
-    
+
     return model, test_metrics
 
 def evaluate_rgcl(model, loader, criterion, device):
@@ -853,4 +994,3 @@ if __name__ == "__main__":
         DEVICE, 
         config=Config
     )
-
